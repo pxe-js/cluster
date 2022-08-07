@@ -5,6 +5,11 @@ import { cpus } from "os";
 import EventEmitter from "events";
 
 declare namespace Cluster {
+    // This exit option exits the child process
+    export type ErrorEvent = "exit" | "continue" | "throw" | "log";
+    // This exit option exits the main process
+    export type ExitEvent = "exit" | "log";
+
     export interface Options {
         readonly advanced?: http.ServerOptions | https.ServerOptions;
         readonly listen?: {
@@ -14,8 +19,8 @@ declare namespace Cluster {
             listeningListener?(): any;
         };
         readonly events?: {
-            readonly error?: "exit" | "continue" | "throw" | "log";
-            readonly exit?: "restart" | "exit" | "log";
+            readonly error?: ErrorEvent | ErrorEvent[];
+            readonly exit?: ExitEvent | ExitEvent[];
         }
         readonly isHttps?: boolean;
     }
@@ -23,6 +28,31 @@ declare namespace Cluster {
     export interface App {
         (req: IncomingMessage, res: ServerResponse): void | Promise<void>
     }
+}
+
+function normalizeOptions(cls: Cluster) {
+    let opts = cls.options;
+
+    // If not set options and instances to default value
+    if (!opts)
+        // @ts-ignore
+        cls.options = opts = {};
+
+    if (!cls.instances)
+        // @ts-ignore
+        cls.instances = cpus().length;
+
+    if (!opts.events)
+        // @ts-ignore
+        opts.events = {};
+
+    if (!opts.listen)
+        // @ts-ignore
+        opts.listen = {};
+
+    for (const key in opts.events)
+        if (!Array.isArray(opts.events[key]))
+            opts.events[key] = [opts.events[key]];
 }
 
 class Cluster extends EventEmitter {
@@ -64,12 +94,17 @@ class Cluster extends EventEmitter {
             }
         }
 
-        // If not set options and instances to default value
-        if (!this.options)
-            this.options = {};
+        normalizeOptions(this);
+    }
 
-        if (!this.instances)
-            this.instances = cpus().length;
+    private fork() {
+        const cw = cluster.fork();
+
+        this.emit("start", cw);
+
+        cw.on("disconnect", () => 
+            cluster.disconnect()
+        );
     }
 
     on(event: "start", listener: (worker: Worker) => void): this;
@@ -81,54 +116,47 @@ class Cluster extends EventEmitter {
 
     start() {
         const opts = this.options;
-        const listenOpts = opts.listen || {};
-        const evOpts = opts.events || {};
+        const listenOpts = opts.listen;
+        const evOpts = opts.events;
 
-        if (cluster.isPrimary) {
-            for (let i = 0; i < this.instances; ++i) {
-                const cw = cluster.fork();
+        const handler = (err: Error) => {
+            // Throw the error
+            if (evOpts.error?.includes("throw"))
+                throw err;
 
-                this.emit("start", cw);
+            // Log the error
+            if (evOpts.error?.includes("log"))
+                console.log("Error:", "\"" + err.message + "\"", "in child process", process.pid);
 
-                cw.on("disconnect", () =>
-                    cluster.disconnect()
-                );
+            // Disconnect all processes
+            if (evOpts.error?.includes("exit")) {
+                process.emit("disconnect");
+                process.exit();
             }
 
-            cluster.on("exit", (...args) => {
-                // Exit normally
-                if (evOpts.exit === "exit")
-                    process.exit();
-                // Restart the child process
-                else if (evOpts.exit === "restart")
-                    cluster.fork();
-                // Log the action
-                else if (evOpts.exit === "log")
-                    console.log("Worker", args[0].process.pid, "exited.");
-                // If no action has been made till this point call the event handler
-                else
-                    this.emit("exit", ...args);
-            });
-        } else {
-            const handler = (err: Error) => {
-                // Throw the error
-                if (evOpts.error === "throw")
-                    throw err;
-                // Disconnect all processes
-                else if (evOpts.error === "exit") {
-                    process.emit("disconnect");
-                    process.exit();
-                }
-                // Log the error
-                else if (evOpts.error === "log") {
-                    console.log("Error:", "\"" + err.message + "\"", "in child process", process.pid);
-                    process.exit();
-                }
-                // Emit the error event if no action has been done yet
-                else
-                    this.emit("error", err, process);
-            };
+            // Emit the error event if no action has been done yet
+            this.emit("error", err, process);
+        };
 
+        const exit = (...args: any[]) => {
+            // Log the action
+            if (evOpts.exit?.includes("log"))
+                console.log("Worker", args[0].process.pid, "exited.");
+
+            // Exit normally
+            if (evOpts.exit?.includes("exit"))
+                process.exit();
+
+            // If no action has been made till this point call the event handler
+            this.emit("exit", ...args);
+        };
+
+        if (cluster.isPrimary) {
+            for (let i = 0; i < this.instances; ++i)
+                this.fork();
+
+            cluster.on("exit", exit);
+        } else {
             process.on("uncaughtException", handler);
 
             (opts.isHttps ? https : http)
