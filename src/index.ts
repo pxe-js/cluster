@@ -1,5 +1,5 @@
 import cluster, { Worker } from "cluster";
-import http from "http";
+import http, { IncomingMessage, ServerResponse } from "http";
 import https from "https";
 import { cpus } from "os";
 import EventEmitter from "events";
@@ -18,16 +18,58 @@ declare namespace Cluster {
             readonly exit?: "restart" | "exit" | "log";
         }
         readonly isHttps?: boolean;
-        app(req: http.IncomingMessage, res: http.ServerResponse): void | Promise<void>;
+    }
+
+    export interface App {
+        (req: IncomingMessage, res: ServerResponse): void | Promise<void>
     }
 }
 
 class Cluster extends EventEmitter {
-    constructor(
-        public readonly options: Cluster.Options,
-        private readonly instances: number = cpus().length
-    ) {
+    readonly options: Cluster.Options;
+    readonly app: Cluster.App;
+    readonly instances: number;
+
+    constructor(app: Cluster.App);
+    constructor(app: Cluster.App, instances: number);
+    constructor(app: Cluster.App, options: Cluster.Options);
+    constructor(app: Cluster.App, instances: number, options: Cluster.Options);
+
+    constructor(...args: any[]) {
         super();
+
+        const firstArg = args[0], nextArg = args[1], lastArg = args[2];
+
+        // Throw error if no app is provided
+        if (typeof firstArg !== "function")
+            throw new Error("Target app is not specified");
+
+        this.app = firstArg;
+
+        if (nextArg) {
+            // If there are 3 args
+            if (lastArg) {
+                this.options = lastArg;
+                this.instances = nextArg;
+            }
+
+            // If there are two args
+            else {
+                // If next arg is a number set the value to instance
+                if (typeof nextArg === "number")
+                    this.instances = nextArg;
+
+                else
+                    this.options = nextArg;
+            }
+        }
+
+        // If not set options and instances to default value
+        if (!this.options)
+            this.options = {};
+
+        if (!this.instances)
+            this.instances = cpus().length;
     }
 
     on(event: "start", listener: (worker: Worker) => void): this;
@@ -64,7 +106,7 @@ class Cluster extends EventEmitter {
                 else if (evOpts.exit === "log")
                     console.log("Worker", args[0].process.pid, "exited.");
                 // If no action has been made till this point call the event handler
-                else 
+                else
                     this.emit("exit", ...args);
             });
         } else {
@@ -83,16 +125,16 @@ class Cluster extends EventEmitter {
                     process.exit();
                 }
                 // Emit the error event if no action has been done yet
-                else 
+                else
                     this.emit("error", err, process);
             };
 
             process.on("uncaughtException", handler);
 
             (opts.isHttps ? https : http)
-                .createServer(opts.advanced, opts.app)
+                .createServer(opts.advanced, this.app)
                 .listen(
-                    listenOpts.port,
+                    listenOpts.port || 8080,
                     listenOpts.hostname,
                     listenOpts.backlog,
                     listenOpts.listeningListener
